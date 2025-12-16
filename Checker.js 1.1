@@ -1,0 +1,218 @@
+"use strict";
+
+const fs = require("fs");
+const notifier = require("node-notifier");
+
+// ================= CONFIG =================
+const CONFIG = {
+  inputFile: "users.txt",
+  availableFile: "available.txt",
+  unavailableFile: "unavailable.txt",
+  apiBaseUrl: "https://api.hystale.com/",
+  concurrency: 2,
+
+  delay: {
+    safe: 1500,
+    fast: 1300,
+    step: 50
+  },
+
+  rateLimitCooldownMs: 3000,
+
+  // Visual separators for "Available" so it doesn't clutter
+  availableSeparator: "──────────────── AVAILABLE ────────────────"
+};
+
+// ================= COLORS =================
+const C = {
+  r: "\x1b[31m",
+  g: "\x1b[32m",
+  b: "\x1b[34m",
+  y: "\x1b[33m",
+  s: "\x1b[90m",
+  x: "\x1b[0m"
+};
+
+const line = "════════════════════════════════════════════";
+const flashFull = ">>>>>>>>>> AVAILABLE FOUND <<<<<<<<<<";
+const FLASH_WIDTH = flashFull.length;
+
+const color = (c, t) => `${c}${t}${C.x}`;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ================= HELPERS =================
+const normalize = s => String(s).trim().toLowerCase();
+const validUsername = s => /^[a-zA-Z0-9_]{2,32}$/.test(String(s).trim());
+
+const read = f =>
+  fs.existsSync(f)
+    ? fs.readFileSync(f, "utf8").split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    : [];
+
+const append = (f, v) => fs.appendFileSync(f, v + "\n");
+const setFromFile = f => new Set(read(f).map(normalize));
+
+const isRateLimited = (status, body) =>
+  status === 429 || /rate|limit|too many|blocked/i.test(body || "");
+
+const pad = (s, w = 16) => String(s).padEnd(w, " ");
+
+const centerText = (text, width) => {
+  text = String(text);
+  if (text.length >= width) return text;
+  const left = Math.floor((width - text.length) / 2);
+  return " ".repeat(left) + text;
+};
+
+const formatMs = ms => {
+  const t = Math.floor(ms / 1000);
+  return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+};
+
+// ================= MAIN =================
+async function main() {
+  // ---------- load files ----------
+  const rawInput = read(CONFIG.inputFile);
+  const availableSet = setFromFile(CONFIG.availableFile);
+  const unavailableSet = setFromFile(CONFIG.unavailableFile);
+
+  // ---------- pre-scan (no dupe printing, no dupe checking) ----------
+  let invalid = 0, dupes = 0, alreadyChecked = 0;
+  const seen = new Set();
+  const queue = [];
+
+  for (const u of rawInput) {
+    if (!validUsername(u)) { invalid++; continue; }
+    const k = normalize(u);
+    if (seen.has(k)) { dupes++; continue; }
+    seen.add(k);
+    if (availableSet.has(k) || unavailableSet.has(k)) {
+      alreadyChecked++; continue;
+    }
+    queue.push(u);
+  }
+
+  // ---------- startup banners (NOW guaranteed to print first) ----------
+  const est = Math.round((queue.length * CONFIG.delay.safe) / CONFIG.concurrency / 1000);
+
+  console.log(color(C.s, line));
+  console.log(color(C.r, " Made by OrganHarvester ♥"));
+  console.log(color(C.s, line));
+  console.log(" Input Summary");
+  console.log(color(C.s, line));
+  console.log(` Total lines        : ${rawInput.length}`);
+  console.log(` Invalid skipped    : ${invalid}`);
+  console.log(` Duplicates removed : ${dupes}`);
+  console.log(` Already checked    : ${alreadyChecked}`);
+  console.log(` Will check         : ${queue.length}`);
+  console.log(` Estimated runtime  : ~${Math.floor(est / 60)}m ${est % 60}s`);
+  console.log(color(C.s, line));
+
+  // ---------- state ----------
+  let currentDelay = CONFIG.delay.safe;
+  let cooldownUntil = 0;
+  let index = 0;
+
+  let countAvailable = 0;
+  let countUnavailable = 0;
+  let firstAvailableMs = null;
+  const startTime = Date.now();
+
+  function triggerRateLimit() {
+    cooldownUntil = Date.now() + CONFIG.rateLimitCooldownMs;
+    currentDelay = CONFIG.delay.safe;
+  }
+
+  function printAvailableBlock(username) {
+    // Extra spacing + divider to avoid clutter
+    console.log(""); // blank line
+    console.log(color(C.s, CONFIG.availableSeparator));
+    console.log(color(C.g, flashFull));
+    console.log(color(C.g, centerText(username, FLASH_WIDTH)));
+    console.log(color(C.g, flashFull));
+    console.log(color(C.s, CONFIG.availableSeparator));
+    console.log(""); // blank line
+  }
+
+  // ---------- worker ----------
+  async function worker() {
+    while (true) {
+      if (index >= queue.length) return;
+
+      const now = Date.now();
+      if (cooldownUntil > now) {
+        await sleep(cooldownUntil - now);
+      }
+
+      const name = queue[index++];
+      const display = pad(name);
+
+      try {
+        const res = await fetch(`${CONFIG.apiBaseUrl}?username=${encodeURIComponent(name)}`, {
+          headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" }
+        });
+
+        const body = await res.text().catch(() => "");
+
+        if (isRateLimited(res.status, body)) {
+          console.log(color(C.y, `${display} > Rate Limited`));
+          triggerRateLimit();
+          index--; // retry later
+          continue;
+        }
+
+        // Success path: speed up slowly toward 1300ms
+        if (res.status === 200) {
+          printAvailableBlock(name);
+
+          append(CONFIG.availableFile, name);
+          availableSet.add(normalize(name));
+          countAvailable++;
+
+          if (firstAvailableMs === null) {
+            firstAvailableMs = Date.now() - startTime;
+          }
+
+          notifier.notify({ title: "Username Available!", message: name, sound: true });
+
+          currentDelay = Math.max(CONFIG.delay.fast, currentDelay - CONFIG.delay.step);
+        } else {
+          console.log(color(C.r, `${display} > Unavailable > ${res.status}`));
+          append(CONFIG.unavailableFile, name);
+          unavailableSet.add(normalize(name));
+          countUnavailable++;
+
+          // On failures, drift back toward safe
+          currentDelay = Math.min(CONFIG.delay.safe, currentDelay + CONFIG.delay.step);
+        }
+      } catch {
+        // Network error: drift toward safe and retry
+        currentDelay = Math.min(CONFIG.delay.safe, currentDelay + CONFIG.delay.step);
+        index--;
+      }
+
+      await sleep(currentDelay);
+    }
+  }
+
+  // ---------- run ----------
+  await Promise.all(Array(CONFIG.concurrency).fill(0).map(worker));
+
+  // ---------- summary ----------
+  console.log("\n" + color(C.s, line));
+  console.log(" SUMMARY");
+  console.log(color(C.s, line));
+  console.log(color(C.g, ` Available   : ${countAvailable}`));
+  console.log(color(C.r, ` Unavailable : ${countUnavailable}`));
+  console.log(color(C.s, ` First Available After : ${firstAvailableMs === null ? "Not found" : formatMs(firstAvailableMs)}`));
+  console.log(color(C.s, line));
+  console.log(color(C.s, " Finished"));
+  console.log(color(C.s, line));
+
+  notifier.notify({ title: "Hystale Checker", message: "Finished checking usernames", sound: true });
+}
+
+main().catch(err => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
