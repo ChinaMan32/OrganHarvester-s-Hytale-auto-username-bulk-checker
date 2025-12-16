@@ -1,7 +1,14 @@
 "use strict";
 
 const fs = require("fs");
-const notifier = require("node-notifier");
+
+// --- Optional notifications (won't crash if broken) ---
+let notifier = null;
+try {
+  notifier = require("node-notifier");
+} catch {
+  notifier = null;
+}
 
 // ================= CONFIG =================
 const CONFIG = {
@@ -17,9 +24,12 @@ const CONFIG = {
     step: 50
   },
 
-  rateLimitCooldownMs: 3000,
+  // Rate-limit handling
+  rateLimitCooldownMs: 3000,   // what you wanted: wait 3s
+  maxRetriesPerUser: 6,        // prevents infinite loops
+  masked400Retries: 2,         // how many times to treat 400 as masked RL during cooldown
 
-  // Visual separators for "Available" so it doesn't clutter
+  // Visual separators for Available
   availableSeparator: "──────────────── AVAILABLE ────────────────"
 };
 
@@ -52,22 +62,43 @@ const read = f =>
 const append = (f, v) => fs.appendFileSync(f, v + "\n");
 const setFromFile = f => new Set(read(f).map(normalize));
 
-const isRateLimited = (status, body) =>
-  status === 429 || /rate|limit|too many|blocked/i.test(body || "");
+function pad(s, w = 16) {
+  return String(s).padEnd(w, " ");
+}
 
-const pad = (s, w = 16) => String(s).padEnd(w, " ");
-
-const centerText = (text, width) => {
+function centerText(text, width) {
   text = String(text);
   if (text.length >= width) return text;
   const left = Math.floor((width - text.length) / 2);
   return " ".repeat(left) + text;
-};
+}
 
-const formatMs = ms => {
+function formatMs(ms) {
   const t = Math.floor(ms / 1000);
   return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
-};
+}
+
+function isRateLimited(status, body) {
+  const b = String(body || "").toLowerCase();
+  return (
+    status === 429 ||
+    b.includes("rate") ||
+    b.includes("limit") ||
+    b.includes("too many") ||
+    b.includes("blocked") ||
+    b.includes("thrott")
+  );
+}
+
+// Notifications that never crash / never spam stacks
+function safeNotify(title, message) {
+  if (!notifier) return;
+  try {
+    notifier.notify({ title, message, sound: true });
+  } catch {
+    // swallow
+  }
+}
 
 // ================= MAIN =================
 async function main() {
@@ -92,7 +123,7 @@ async function main() {
     queue.push(u);
   }
 
-  // ---------- startup banners (NOW guaranteed to print first) ----------
+  // ---------- startup banners ----------
   const est = Math.round((queue.length * CONFIG.delay.safe) / CONFIG.concurrency / 1000);
 
   console.log(color(C.s, line));
@@ -110,41 +141,66 @@ async function main() {
 
   // ---------- state ----------
   let currentDelay = CONFIG.delay.safe;
-  let cooldownUntil = 0;
-  let index = 0;
 
+  // global pause shared by ALL workers
+  let globalPauseUntil = 0;
+  let lastRateLimitAt = 0;
+
+  // retry queue fixes skipped “rate-limited words”
+  const retryQueue = [];
+
+  // retry caps per user
+  const attempts = new Map(); // username(normalized) -> number
+
+  // stats
   let countAvailable = 0;
   let countUnavailable = 0;
   let firstAvailableMs = null;
   const startTime = Date.now();
 
-  function triggerRateLimit() {
-    cooldownUntil = Date.now() + CONFIG.rateLimitCooldownMs;
+  function bumpAttempt(name) {
+    const k = normalize(name);
+    const v = (attempts.get(k) || 0) + 1;
+    attempts.set(k, v);
+    return v;
+  }
+
+  function getAttempt(name) {
+    return attempts.get(normalize(name)) || 0;
+  }
+
+  function triggerGlobalCooldown() {
+    lastRateLimitAt = Date.now();
+    globalPauseUntil = Math.max(globalPauseUntil, lastRateLimitAt + CONFIG.rateLimitCooldownMs);
     currentDelay = CONFIG.delay.safe;
   }
 
   function printAvailableBlock(username) {
-    // Extra spacing + divider to avoid clutter
-    console.log(""); // blank line
+    console.log("");
     console.log(color(C.s, CONFIG.availableSeparator));
     console.log(color(C.g, flashFull));
     console.log(color(C.g, centerText(username, FLASH_WIDTH)));
     console.log(color(C.g, flashFull));
     console.log(color(C.s, CONFIG.availableSeparator));
-    console.log(""); // blank line
+    console.log("");
   }
 
   // ---------- worker ----------
-  async function worker() {
+  async function worker(workerId) {
     while (true) {
-      if (index >= queue.length) return;
+      // stop condition (both queues empty)
+      if (retryQueue.length === 0 && queue.length === 0) return;
 
+      // global cooldown check
       const now = Date.now();
-      if (cooldownUntil > now) {
-        await sleep(cooldownUntil - now);
+      if (globalPauseUntil > now) {
+        await sleep(globalPauseUntil - now);
       }
 
-      const name = queue[index++];
+      // pull from retry first, otherwise from main queue
+      const name = retryQueue.length ? retryQueue.shift() : queue.shift();
+      if (!name) continue;
+
       const display = pad(name);
 
       try {
@@ -154,14 +210,39 @@ async function main() {
 
         const body = await res.text().catch(() => "");
 
+        // ---- HARD rate limit detection ----
         if (isRateLimited(res.status, body)) {
           console.log(color(C.y, `${display} > Rate Limited`));
-          triggerRateLimit();
-          index--; // retry later
+
+          const n = bumpAttempt(name);
+          if (n <= CONFIG.maxRetriesPerUser) {
+            triggerGlobalCooldown();
+            retryQueue.push(name);
+            safeNotify("Hystale Checker", `Rate limited — cooling down ${CONFIG.rateLimitCooldownMs / 1000}s`);
+          } else {
+            // give up after too many RL hits
+            console.log(color(C.r, `${display} > Unavailable > 400`));
+            append(CONFIG.unavailableFile, name);
+            unavailableSet.add(normalize(name));
+            countUnavailable++;
+          }
           continue;
         }
 
-        // Success path: speed up slowly toward 1300ms
+        // ---- MASKED 400 handling ----
+        // If we recently rate-limited and are effectively still in that window,
+        // treat some 400s as throttle fallout and retry (limited times).
+        const inRlWindow = (Date.now() - lastRateLimitAt) < (CONFIG.rateLimitCooldownMs * 2);
+
+        if (res.status === 400 && inRlWindow && getAttempt(name) < CONFIG.masked400Retries) {
+          console.log(color(C.y, `${display} > Rate Limited`));
+          bumpAttempt(name);
+          triggerGlobalCooldown();
+          retryQueue.push(name);
+          continue;
+        }
+
+        // ---- normal classification ----
         if (res.status === 200) {
           printAvailableBlock(name);
 
@@ -173,22 +254,39 @@ async function main() {
             firstAvailableMs = Date.now() - startTime;
           }
 
-          notifier.notify({ title: "Username Available!", message: name, sound: true });
+          safeNotify("Username Available!", name);
 
+          // move toward fast
           currentDelay = Math.max(CONFIG.delay.fast, currentDelay - CONFIG.delay.step);
+        } else if (res.status === 400) {
+          console.log(color(C.r, `${display} > Unavailable > 400`));
+          append(CONFIG.unavailableFile, name);
+          unavailableSet.add(normalize(name));
+          countUnavailable++;
+
+          // drift toward safe
+          currentDelay = Math.min(CONFIG.delay.safe, currentDelay + CONFIG.delay.step);
         } else {
           console.log(color(C.r, `${display} > Unavailable > ${res.status}`));
           append(CONFIG.unavailableFile, name);
           unavailableSet.add(normalize(name));
           countUnavailable++;
 
-          // On failures, drift back toward safe
           currentDelay = Math.min(CONFIG.delay.safe, currentDelay + CONFIG.delay.step);
         }
       } catch {
-        // Network error: drift toward safe and retry
+        // network error: retry but cap it
+        const n = bumpAttempt(name);
         currentDelay = Math.min(CONFIG.delay.safe, currentDelay + CONFIG.delay.step);
-        index--;
+
+        if (n <= CONFIG.maxRetriesPerUser) {
+          retryQueue.push(name);
+        } else {
+          console.log(color(C.r, `${display} > Unavailable > 400`));
+          append(CONFIG.unavailableFile, name);
+          unavailableSet.add(normalize(name));
+          countUnavailable++;
+        }
       }
 
       await sleep(currentDelay);
@@ -196,7 +294,7 @@ async function main() {
   }
 
   // ---------- run ----------
-  await Promise.all(Array(CONFIG.concurrency).fill(0).map(worker));
+  await Promise.all(Array(CONFIG.concurrency).fill(0).map((_, i) => worker(i)));
 
   // ---------- summary ----------
   console.log("\n" + color(C.s, line));
@@ -209,7 +307,7 @@ async function main() {
   console.log(color(C.s, " Finished"));
   console.log(color(C.s, line));
 
-  notifier.notify({ title: "Hystale Checker", message: "Finished checking usernames", sound: true });
+  safeNotify("Hystale Checker", "Finished checking usernames");
 }
 
 main().catch(err => {
