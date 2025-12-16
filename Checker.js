@@ -97,7 +97,6 @@ async function checkUsername(username) {
     return;
   }
 
-  // Treat 400 and everything else as unavailable (same as your original logic)
   console.log(`${username} > Unavailable > ${status}`);
   appendLine(CONFIG.unavailableFile, username);
   unavailable.add(key);
@@ -125,3 +124,4 @@ async function run() {
 }
 
 run();
+
