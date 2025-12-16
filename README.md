@@ -30,12 +30,12 @@ npm init -y
 
 this will create a package.json file. 
 
-Step 6: Install the required package (optional)
+Step 5: Install the required package (optional)
 this script uses Notifications for automation so this is not needed but just optional
 Open CMD and run 
 npm install node-notifier
 
-Step 7: Run the script
+Step 6: Run the script
 Run this in CMD
 node Checker.js
 
@@ -45,7 +45,7 @@ Name > Available > 200
 Name > Unavailable > 400
 Name > Duplicate
 
-Step 8: Check your output files
+Step 7: Check your output files
 
 After running, your folder will contain:
 
